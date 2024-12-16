@@ -13,7 +13,8 @@
     "@octokit/rest": "^21.0.2",
     "asana": "^3.0.12",
     "dayjs": "^1.11.13",
-    "vega": "^5.30.0"
+    "vega": "^5.30.0",
+    "vega-lite": "^5.23.0"
   },
   "devDependencies": {
     "dotenv": "^16.4.7"

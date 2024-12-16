@@ -1,8 +1,12 @@
 import { Octokit } from "@octokit/rest";
 import { config } from "dotenv";
+import fs from "fs/promises";
+import dayjs from "dayjs";
+import isBetween from "dayjs/plugin/isBetween.js";
 
-// Initialize dotenv
+// Initialize dotenv and dayjs plugins
 config();
+dayjs.extend(isBetween);
 
 class GitHubStatsAnalyzer {
   constructor(token) {
@@ -14,7 +18,7 @@ class GitHubStatsAnalyzer {
     });
   }
 
-  async getRepositoryStats(owner, repo) {
+  async getRepositoryStats(owner, repo, startDate, endDate) {
     try {
       // Get commit activity for the last year
       const commitActivity = await this.retryRequest(async () => {
@@ -28,34 +32,51 @@ class GitHubStatsAnalyzer {
         return response.data;
       });
 
-      // Get PR statistics
-      const pullRequests = await this.octokit.request(
-        "GET /repos/{owner}/{repo}/pulls",
-        {
-          owner,
-          repo,
-          state: "all",
-          sort: "created",
-          direction: "desc",
-          per_page: 100,
-        }
+      // Get all PR statistics with pagination
+      const pullRequests = await this.getAllPaginatedData(
+        async (page) => {
+          const response = await this.octokit.request(
+            "GET /repos/{owner}/{repo}/pulls",
+            {
+              owner,
+              repo,
+              state: "all",
+              sort: "created",
+              direction: "desc",
+              per_page: 100,
+              page,
+            }
+          );
+          return response;
+        },
+        (pr) => dayjs(pr.created_at).isBetween(startDate, endDate, null, "[]")
       );
 
-      // Get deployment statistics
-      const deployments = await this.octokit.request(
-        "GET /repos/{owner}/{repo}/deployments",
-        {
-          owner,
-          repo,
-          per_page: 100,
-        }
+      // Get all deployment statistics with pagination
+      const deployments = await this.getAllPaginatedData(
+        async (page) => {
+          const response = await this.octokit.request(
+            "GET /repos/{owner}/{repo}/deployments",
+            {
+              owner,
+              repo,
+              per_page: 100,
+              page,
+            }
+          );
+          return response;
+        },
+        (deployment) =>
+          dayjs(deployment.created_at).isBetween(startDate, endDate, null, "[]")
       );
 
       // Process and analyze the data
       const stats = this.processStats(
         commitActivity,
-        pullRequests.data,
-        deployments.data
+        pullRequests,
+        deployments,
+        startDate,
+        endDate
       );
       return stats;
     } catch (error) {
@@ -64,27 +85,68 @@ class GitHubStatsAnalyzer {
     }
   }
 
+  async getAllPaginatedData(requestFn, filterFn) {
+    let page = 1;
+    let allData = [];
+    let hasNextPage = true;
+
+    while (hasNextPage) {
+      try {
+        const response = await requestFn(page);
+        const { data, headers } = response;
+
+        if (data.length === 0) {
+          break;
+        }
+
+        // Apply date filter
+        const filteredData = filterFn ? data.filter(filterFn) : data;
+        allData = allData.concat(filteredData);
+
+        // Check if there's a next page using GitHub's Link header
+        const linkHeader = headers.link;
+        hasNextPage = linkHeader && linkHeader.includes('rel="next"');
+
+        // If all items in current page are filtered out and there's no next page, break
+        if (filteredData.length === 0 && !hasNextPage) {
+          break;
+        }
+
+        page++;
+      } catch (error) {
+        console.error(`Error fetching page ${page}:`, error);
+        break;
+      }
+    }
+
+    return allData;
+  }
+
   async retryRequest(requestFn, maxRetries = 5) {
     for (let i = 0; i < maxRetries; i++) {
       try {
         const response = await requestFn();
         if (response && Array.isArray(response)) return response;
-        console.log(`Attempt ${i + 1}: Waiting for GitHub to compute statistics...`);
+        console.log(
+          `Attempt ${i + 1}: Waiting for GitHub to compute statistics...`
+        );
         await new Promise((resolve) => setTimeout(resolve, 2000 * (i + 1)));
       } catch (error) {
         if (error.status === 202) {
-          console.log(`Attempt ${i + 1}: GitHub is computing statistics (202 status)...`);
+          console.log(
+            `Attempt ${i + 1}: GitHub is computing statistics (202 status)...`
+          );
           await new Promise((resolve) => setTimeout(resolve, 2000 * (i + 1)));
           continue;
         }
         throw error;
       }
     }
-    console.log('Maximum retries reached, returning empty array');
+    console.log("Maximum retries reached, returning empty array");
     return [];
   }
 
-  processStats(commitActivity, pullRequests, deployments) {
+  processStats(commitActivity, pullRequests, deployments, startDate, endDate) {
     // Add safety check for commitActivity
     if (!Array.isArray(commitActivity)) {
       console.log("Commit activity data:", commitActivity);
@@ -96,6 +158,45 @@ class GitHubStatsAnalyzer {
       week: new Date(week.week * 1000).toISOString().split("T")[0],
       commits: week.total,
     }));
+
+    // Process PRs by week
+    const weeklyPRStats = {};
+    pullRequests.forEach((pr) => {
+      const weekStart = new Date(pr.created_at);
+      weekStart.setUTCHours(0, 0, 0, 0);
+      weekStart.setUTCDate(weekStart.getUTCDate() - weekStart.getUTCDay());
+      const weekKey = weekStart.toISOString().split("T")[0];
+
+      if (!weeklyPRStats[weekKey]) {
+        weeklyPRStats[weekKey] = {
+          prCount: 0,
+          mergedCount: 0,
+          totalMergeTime: 0, // in hours
+        };
+      }
+
+      weeklyPRStats[weekKey].prCount++;
+
+      if (pr.merged_at) {
+        weeklyPRStats[weekKey].mergedCount++;
+        const mergeTime =
+          (new Date(pr.merged_at) - new Date(pr.created_at)) / (1000 * 60 * 60); // Convert to hours
+        weeklyPRStats[weekKey].totalMergeTime += mergeTime;
+      }
+    });
+
+    // Convert weeklyPRStats to array format and calculate averages
+    const weeklyPRMetrics = Object.entries(weeklyPRStats)
+      .map(([week, stats]) => ({
+        week,
+        prCount: stats.prCount,
+        mergedCount: stats.mergedCount,
+        averageMergeTime:
+          stats.mergedCount > 0
+            ? (stats.totalMergeTime / stats.mergedCount).toFixed(2)
+            : 0,
+      }))
+      .sort((a, b) => a.week.localeCompare(b.week));
 
     // Calculate PR metrics
     const prMetrics = {
@@ -126,7 +227,7 @@ class GitHubStatsAnalyzer {
       (deploy) => new Date(deploy.created_at) > lastMonth
     );
 
-    return {
+    const stats = {
       commitStats: {
         totalCommitsLastYear: weeklyCommits.reduce(
           (sum, week) => sum + week.commits,
@@ -141,14 +242,45 @@ class GitHubStatsAnalyzer {
       prStats: {
         ...prMetrics,
         recentPRCount: recentPRs.length,
-        recentPRsPerWeek: (recentPRs.length / 4).toFixed(2), // Last 4 weeks
+        recentPRsPerWeek: (recentPRs.length / 4).toFixed(2),
+        weeklyMetrics: weeklyPRMetrics,
       },
       deploymentStats: {
         ...deploymentMetrics,
         recentDeploymentCount: recentDeployments.length,
-        recentDeploymentsPerWeek: (recentDeployments.length / 4).toFixed(2), // Last 4 weeks
+        recentDeploymentsPerWeek: (recentDeployments.length / 4).toFixed(2),
       },
     };
+
+    // Export detailed stats to JSON
+    this.exportStatsToJson(stats, startDate, endDate);
+
+    return stats;
+  }
+
+  async exportStatsToJson(stats, startDate, endDate) {
+    try {
+      // Ensure output directory exists
+      await fs.mkdir("output", { recursive: true });
+
+      // Export the full stats
+      await fs.writeFile(
+        `output/detailed-metrics-${startDate}-${endDate}.json`,
+        JSON.stringify(stats, null, 2)
+      );
+
+      // Export weekly PR metrics separately for easier consumption
+      const weeklyMetrics = {
+        commits: stats.commitStats.weeklyCommitTrend,
+        pullRequests: stats.prStats.weeklyMetrics,
+      };
+      await fs.writeFile(
+        `output/weekly-metrics-${startDate}-${endDate}.json`,
+        JSON.stringify(weeklyMetrics, null, 2)
+      );
+    } catch (error) {
+      console.error("Error exporting stats to JSON:", error);
+    }
   }
 
   generateReport(stats) {
@@ -186,9 +318,13 @@ async function main() {
   const analyzer = new GitHubStatsAnalyzer(token);
 
   try {
+    const startDate = process.env.START_DATE;
+    const endDate = process.env.END_DATE;
     const stats = await analyzer.getRepositoryStats(
       process.env.GITHUB_OWNER,
-      process.env.GITHUB_REPO
+      process.env.GITHUB_REPO,
+      startDate,
+      endDate
     );
     const report = analyzer.generateReport(stats);
     console.log(report);
