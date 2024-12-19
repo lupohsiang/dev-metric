@@ -23,6 +23,7 @@ cd dev-metric
 
 ```bash
 npm install
+# or pnpm i
 ```
 
 ## 設定環境變數
