@@ -3,6 +3,8 @@ import { config } from "dotenv";
 import fs from "fs/promises";
 import dayjs from "dayjs";
 import isBetween from "dayjs/plugin/isBetween.js";
+import vega from "vega";
+import { compile } from "vega-lite";
 
 // Initialize dotenv and dayjs plugins
 config();
@@ -45,6 +47,7 @@ class GitHubStatsAnalyzer {
               direction: "desc",
               per_page: 100,
               page,
+              labels: ["bug"]
             }
           );
           return response;
@@ -171,11 +174,20 @@ class GitHubStatsAnalyzer {
         weeklyPRStats[weekKey] = {
           prCount: 0,
           mergedCount: 0,
-          totalMergeTime: 0, // in hours
+          totalMergeTime: 0,
+          bugPRCount: 0,
+          mergedBugPRCount: 0
         };
       }
 
       weeklyPRStats[weekKey].prCount++;
+
+      if (pr.labels.some(label => label.name === "bug")) {
+        weeklyPRStats[weekKey].bugPRCount++;
+        if (pr.merged_at) {
+          weeklyPRStats[weekKey].mergedBugPRCount++;
+        }
+      }
 
       if (pr.merged_at) {
         weeklyPRStats[weekKey].mergedCount++;
@@ -195,6 +207,8 @@ class GitHubStatsAnalyzer {
           stats.mergedCount > 0
             ? (stats.totalMergeTime / stats.mergedCount).toFixed(2)
             : 0,
+        bugPRCount: stats.bugPRCount,
+        mergedBugPRCount: stats.mergedBugPRCount
       }))
       .sort((a, b) => a.week.localeCompare(b.week));
 
@@ -244,6 +258,11 @@ class GitHubStatsAnalyzer {
         recentPRCount: recentPRs.length,
         recentPRsPerWeek: (recentPRs.length / 4).toFixed(2),
         weeklyMetrics: weeklyPRMetrics,
+        bugPRs: {
+          total: pullRequests.filter(pr => pr.labels.some(label => label.name === "bug")).length,
+          merged: pullRequests.filter(pr => pr.merged_at && pr.labels.some(label => label.name === "bug")).length,
+          weeklyMetrics: weeklyPRMetrics
+        }
       },
       deploymentStats: {
         ...deploymentMetrics,
@@ -283,6 +302,190 @@ class GitHubStatsAnalyzer {
     }
   }
 
+  async generateCharts(stats) {
+    // PR Trends Chart Specification
+    const prTrendsSpec = {
+      $schema: "https://vega.github.io/schema/vega-lite/v5.json",
+      width: 800,
+      height: 400,
+      data: { values: stats.prStats.weeklyMetrics },
+      layer: [
+        {
+          mark: { type: "line", point: true },
+          encoding: {
+            x: { field: "week", type: "temporal", title: "Week" },
+            y: { field: "prCount", type: "quantitative", title: "Count" },
+            color: { 
+              datum: "Total PRs",
+              legend: { title: "PR Metrics" }
+            },
+            tooltip: [
+              { field: "week", type: "temporal", title: "Week" },
+              { field: "prCount", type: "quantitative", title: "Total PRs" },
+              { field: "mergedCount", type: "quantitative", title: "Merged PRs" }
+            ]
+          }
+        },
+        {
+          mark: { type: "line", point: true, strokeDash: [4, 4] },
+          encoding: {
+            x: { field: "week", type: "temporal" },
+            y: { field: "mergedCount", type: "quantitative" },
+            color: { 
+              datum: "Merged PRs",
+              legend: { title: "PR Metrics" }
+            }
+          }
+        }
+      ],
+      title: "PR Creation and Merge Trends",
+      config: {
+        legend: {
+          orient: "top-right",
+          fillColor: "#FFFFFF",
+          padding: 10,
+          cornerRadius: 4,
+          strokeWidth: 1
+        }
+      }
+    };
+
+    // Merge Time Chart Specification
+    const mergeTimeSpec = {
+      $schema: "https://vega.github.io/schema/vega-lite/v5.json",
+      width: 800,
+      height: 400,
+      data: { values: stats.prStats.weeklyMetrics },
+      mark: { 
+        type: "line", 
+        point: true,
+        color: "#4C78A8"
+      },
+      encoding: {
+        x: { field: "week", type: "temporal", title: "Week" },
+        y: { 
+          field: "averageMergeTime", 
+          type: "quantitative", 
+          title: "Average Time (hours)" 
+        },
+        tooltip: [
+          { field: "week", type: "temporal", title: "Week" },
+          { field: "averageMergeTime", type: "quantitative", title: "Average Merge Time (hours)" }
+        ]
+      },
+      title: "Average PR Merge Time Trend"
+    };
+
+    // Commit Activity Chart Specification
+    const commitSpec = {
+      $schema: "https://vega.github.io/schema/vega-lite/v5.json",
+      width: 800,
+      height: 400,
+      data: { values: stats.commitStats.weeklyCommitTrend },
+      mark: { 
+        type: "bar",
+        color: "#4C78A8",
+        tooltip: true
+      },
+      encoding: {
+        x: { field: "week", type: "temporal", title: "Week" },
+        y: { field: "commits", type: "quantitative", title: "Number of Commits" },
+        tooltip: [
+          { field: "week", type: "temporal", title: "Week" },
+          { field: "commits", type: "quantitative", title: "Commits" }
+        ]
+      },
+      title: "Weekly Commit Activity",
+      config: {
+        bar: {
+          binSpacing: 1,
+          cornerRadiusEnd: 4
+        }
+      }
+    };
+
+    // Bug PR Trend Chart Specification
+    const bugPRTrendSpec = {
+      $schema: "https://vega.github.io/schema/vega-lite/v5.json",
+      width: 800,
+      height: 400,
+      data: { values: stats.prStats.bugPRs.weeklyMetrics },
+      layer: [
+        {
+          mark: { type: "line", point: true },
+          encoding: {
+            x: { field: "week", type: "temporal", title: "Week" },
+            y: { field: "bugPRCount", type: "quantitative", title: "Count" },
+            color: { 
+              datum: "Total Bug PRs",
+              legend: { title: "Bug PR Metrics" }
+            },
+            tooltip: [
+              { field: "week", type: "temporal", title: "Week" },
+              { field: "bugPRCount", type: "quantitative", title: "Total Bug PRs" },
+              { field: "mergedBugPRCount", type: "quantitative", title: "Merged Bug PRs" }
+            ]
+          }
+        },
+        {
+          mark: { type: "line", point: true, strokeDash: [4, 4] },
+          encoding: {
+            x: { field: "week", type: "temporal" },
+            y: { field: "mergedBugPRCount", type: "quantitative" },
+            color: { 
+              datum: "Merged Bug PRs",
+              legend: { title: "Bug PR Metrics" }
+            }
+          }
+        }
+      ],
+      title: "Bug PR Creation and Merge Trends",
+      config: {
+        legend: {
+          orient: "top-right",
+          fillColor: "#FFFFFF",
+          padding: 10,
+          cornerRadius: 4,
+          strokeWidth: 1
+        }
+      }
+    };
+
+    try {
+      // Create output/charts directory if it doesn't exist
+      await fs.mkdir("output/charts", { recursive: true });
+
+      // Generate and save each chart
+      const specs = [
+        { spec: prTrendsSpec, filename: "pr-trends.svg" },
+        { spec: mergeTimeSpec, filename: "merge-time-trend.svg" },
+        { spec: commitSpec, filename: "commit-activity.svg" },
+        { spec: bugPRTrendSpec, filename: "bug-pr-trend.svg" }
+      ];
+
+      for (const { spec, filename } of specs) {
+        // Compile Vega-Lite to Vega
+        const vegaSpec = compile(spec).spec;
+        
+        // Create a new Vega View
+        const view = new vega.View(vega.parse(vegaSpec))
+          .renderer('none')
+          .initialize();
+
+        // Generate SVG
+        const svg = await view.toSVG();
+        await fs.writeFile(`output/charts/${filename}`, svg);
+        
+        // Clean up
+        view.finalize();
+      }
+
+      console.log("Charts generated successfully in output/charts directory");
+    } catch (error) {
+      console.error("Error generating charts:", error);
+    }
+  }
+
   generateReport(stats) {
     return `
 Development Efficiency Report
@@ -296,18 +499,17 @@ Development Efficiency Report
    - Merged PRs: ${stats.prStats.mergedPRs}
    - PR merge rate: ${stats.prStats.prMergeRate}%
    - Average PRs per week: ${stats.prStats.averagePRsPerWeek.toFixed(2)}
-   - Recent PR frequency (last month): ${
-     stats.prStats.recentPRsPerWeek
-   } PRs/week
+   - Recent PR frequency (last month): ${stats.prStats.recentPRsPerWeek} PRs/week
 
-3. Deployment Metrics
+3. Bug PR Metrics
+   - Total bug PRs: ${stats.prStats.bugPRs.total}
+   - Merged bug PRs: ${stats.prStats.bugPRs.merged}
+   - Bug PR merge rate: ${((stats.prStats.bugPRs.merged / stats.prStats.bugPRs.total) * 100).toFixed(2)}%
+
+4. Deployment Metrics
    - Total deployments: ${stats.deploymentStats.totalDeployments}
-   - Average deployments per week: ${stats.deploymentStats.averageDeploymentsPerWeek.toFixed(
-     2
-   )}
-   - Recent deployment frequency (last month): ${
-     stats.deploymentStats.recentDeploymentsPerWeek
-   } deployments/week
+   - Average deployments per week: ${stats.deploymentStats.averageDeploymentsPerWeek.toFixed(2)}
+   - Recent deployment frequency (last month): ${stats.deploymentStats.recentDeploymentsPerWeek} deployments/week
 `;
   }
 }
@@ -328,6 +530,9 @@ async function main() {
     );
     const report = analyzer.generateReport(stats);
     console.log(report);
+    
+    // Generate charts
+    await analyzer.generateCharts(stats);
   } catch (error) {
     console.error("Error generating report:", error);
   }
